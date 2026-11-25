@@ -71,6 +71,12 @@ function hooks() {
       instance.slots.forEach((slot) => slot.cleanup?.())
       instance.mounted = false
     },
+    /** 卸载并丢弃组件状态：真实卸载后重挂载会重跑全部 effect（侧栏切换即此形态）。 */
+    remountKey(key, component) {
+      this.unmount(key)
+      instances.delete(key)
+      return this.render(key, component)
+    },
     get updatesAfterUnmount() { return updatesAfterUnmount },
   }
 }
@@ -100,7 +106,12 @@ function button(tree, label) {
 function fixture(transport, dynamic = false) {
   const runner = hooks(), doc = documentStub(), entries = new Map(), disposers = [], calls = []
   const slots = {
-    register(options, component) { const key = options.id || options.key; entries.set(key, component); return () => entries.delete(key) },
+    // 复合键：main 与 panellist 是不同 slot，同名 id 也不互相覆盖。
+    register(options, component) {
+      const key = `${options.name}:${options.key || options.id}`
+      entries.set(key, component)
+      return () => entries.delete(key)
+    },
     inject(_slot, effect) { const off = effect(); disposers.push(off); return off },
   }
   const invoke = (...args) => { calls.push(args); return transport(...args) }
@@ -114,17 +125,18 @@ function fixture(transport, dynamic = false) {
     })
   }
   plugin.apply({ get: () => slots, effect(fn) { const off = fn(); disposers.push(off); return off } })
-  const render = () => runner.render('view', entries.get(dynamic ? 'self' : 'hermes-memory-panel'))
+  const render = () => runner.render('view', entries.get(dynamic ? 'tool.view.cordis:self' : 'main:hermes-memory'))
   return {
     plugin, calls, doc, runner, render,
+    // 页面形态：面板随主区挂载直接渲染，没有开关按钮与浮层。
     show() {
       render()
-      const entry = runner.render('entry', entries.get('hermes-memory'))
-      entry.props.onClick()
       return render()
     },
-    close() { button(render(), '×').props.onClick(); render() },
-    reopen() { runner.render('entry', entries.get('hermes-memory')).props.onClick(); return render() },
+    // 侧栏切换走卸载/重挂载：丢弃组件状态、effect 重跑，旧载入随之作废。
+    async remount() {
+      return runner.remountKey('view', entries.get(dynamic ? 'tool.view.cordis:self' : 'main:hermes-memory'))
+    },
     dispose() { runner.unmount('view'); disposers.reverse().forEach((off) => off?.()) },
   }
 }
@@ -135,6 +147,37 @@ function section(tree, bank = 'memory') {
 }
 
 // Synthetic payloads only: tests never connect to a real service or expose memory contents.
+test('static: registers the panel-list entry and the main page, not the footer/overlay pair', async () => {
+  const registrations = []
+  const runner = hooks(), doc = documentStub()
+  const slots = {
+    register(options, component) { registrations.push({ options, component }); return () => {} },
+    inject(slot, effect) { effect(); return () => {} },
+  }
+  let plugin
+  vm.runInNewContext(source, {
+    window: { __ModuleLoader__: { load(registration) { plugin = registration.factory(() => runner.React) } } },
+    document: doc, fetch: async () => response(list()),
+  })
+  plugin.apply({ get: () => slots, effect(fn) { return fn() } })
+  const names = registrations.map((r) => r.options.name)
+  assert.ok(names.includes('main') && names.includes('sidebar.panellist'), 'panel pair registered')
+  assert.ok(!names.includes('sidebar.footer.action') && !names.includes('shell.overlay'), 'old mounts removed')
+  const page = registrations.find((r) => r.options.name === 'main')
+  const icon = registrations.find((r) => r.options.name === 'sidebar.panellist')
+  assert.equal(page.options.key, 'hermes-memory')
+  assert.equal(icon.options.id, 'hermes-memory')
+  assert.equal(icon.options.label(), '记忆文档')
+  const entry = icon.component({ size: 16 })
+  const svg = typeof entry.type === 'function' ? entry.type(entry.props) : entry
+  assert.equal(svg.type, 'svg', 'panel list entry renders an icon')
+  // 页面挂载即载入：直接渲染即可取到数据，不需要先点任何开关。
+  const view = runner.render('view', page.component)
+  await tick()
+  const tree = runner.render('view', page.component)
+  assert.match(text(tree), /MEMORY/)
+})
+
 test('static: slots dependency and owned stylesheet cleanup', () => {
   const h = fixture(async () => response(list()))
   assert.equal(h.plugin.inject.join(','), 'slots')
@@ -268,10 +311,11 @@ test('static: a committed write followed by failed reload is not retried as anot
   assert.equal(h.calls.filter(([, init]) => JSON.parse(init.body).action === 'add').length, 1)
 })
 
-test('static: close/reopen invalidates older loads; unmount ignores pending completions', async () => {
+test('static: remount invalidates older loads; unmount ignores pending completions', async () => {
   const pending = []
   const h = fixture(() => { const answer = deferred(); pending.push(answer); return answer.promise })
-  h.show(); h.close(); h.reopen()
+  await h.show()
+  await h.remount()
   pending[1].resolve(response(list(['synthetic newer'])))
   await tick()
   pending[0].resolve(response(list(['synthetic stale'])))
@@ -279,7 +323,7 @@ test('static: close/reopen invalidates older loads; unmount ignores pending comp
   assert.equal(section(h.render()).list[0], 'synthetic newer')
   button(h.render(), '刷新').props.onClick()
   h.dispose()
-  pending[2].resolve(response(list(['synthetic after unmount'])))
+  pending[2] && pending[2].resolve(response(list(['synthetic after unmount'])))
   await tick()
   assert.equal(h.runner.updatesAfterUnmount, 0)
 })
@@ -373,10 +417,10 @@ test('real DSH: declaration gate, owner reload, plugin unload and CSS cleanup', 
   await serviceFiber
   await tick()
   const slots = ctx.get('slots')
-  assert.throws(() => slots.register({ name: 'sidebar.footer.action', id: 'ungated' }, () => null), /not declared/)
-  const counts = () => ['sidebar.footer.action', 'shell.overlay'].map((name) => slots.entriesOfSlot(name).length)
+  assert.throws(() => slots.register({ name: 'sidebar.settings', id: 'ungated' }, () => null), /not declared/)
+  const counts = () => ['main', 'sidebar.panellist'].map((name) => slots.entriesOfSlot(name).length)
   const declare = () => slots.register({ name: 'root', children: {
-    'sidebar.footer.action': { kind: 'list', scope: 'root' }, 'shell.overlay': { kind: 'list', scope: 'root' },
+    'main': { kind: 'keyed', scope: 'root' }, 'sidebar.panellist': { kind: 'list', scope: 'root' },
   } }, () => null)
   assert.deepEqual(counts(), [0, 0])
   let owner = declare()
